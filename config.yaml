@@ -1,0 +1,33 @@
+model:
+   num_embd: 1024             # number of dimensions to represent the token
+   num_layers: 16             # number of transformer blocks
+   num_dense_layers: 2        # First N layers which are dense
+   num_attention_heads: 16    # Number of attention heads per block (head_dimension = num_embd//num_attention heads)
+   intermediate_size: 4096    # Overall FeedForward dim size (4 * n_embd)
+
+   # MLA
+   latent_dim: 16             # Dimension of the compressed latent space (head dim//2 or 4)
+   proj_matrix_size: 256      # the proj matrices to up and down project
+
+   # MOE
+   num_experts: 16            # Total number of routed experts per MoE layer
+   num_activated_experts: 2   # K: num of experts activated per token
+   expert_inter_size: 1024    # Intermediate size for each expert's FFN (intermediate_size/num_experts * 2)
+
+training:
+   batch_size: 16             # Number of batches trained at the same time
+   num_epochs: 10             # number of complete passes through the dataset
+   learning_rate: 0.0003      # learning rate for training
+   warmup_steps: 1000         # starting steps with low learning rate
+   num_predicted_tokens: 2    # number of future tokens that are simultaneously predicted
+
+data:
+   vocab_size: 30522          # number of tokens in the vocabulary
+   block_size: 1024           # Context size
+   train_file: "data/wiki_small.txt" # File to train from
+
+device:
+   device: "cuda"             # Device to be used for training
+   world_size: 1              # how many systems are you distributing across
+   rank: 0                    # each process is numbered from 0 to world_size - 1
+
