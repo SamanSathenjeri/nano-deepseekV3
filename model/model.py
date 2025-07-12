@@ -8,7 +8,12 @@ from torch.nn import functional as F
 import torch.distributed as dist
 
 from utils import load_config
-import sys
+from MLA import MLA
+from MOE import MOE
+from RoPE import precompute_rope_embeddings
+# import sys
+
+rank = 0
 
 @dataclass
 class DPS_Config:
@@ -21,8 +26,25 @@ class DPS_Config:
         num_dense_layers(int) = Number of dense layers in the model (layers before we send to MoE)
         num_attention_heads(int) = Number of attention heads
         intermediate_size(int) = Intermediate dimension for MLP layers
+        
+        latent_dim(int) = 
+        proj_matrix_size(int) = 
+
+        num_experts(int) = 
+        num_activated(int) = 
+        expert_inter_size(int) = 
+
+        batch_size(int) = 
+        num_epochs(int) = 
+        learning_rate(int) = 
+        warmup_steps(int) = 
+        num_predicted_tokens(int) = 
+
         block_size(int) = Context size
         vocab_size(int) = Vocabulary size
+
+        device(string) = the device to train on ("cuda", "cpu", etc...)
+        world_size(int) = the number of processes running in parallel
     """
 
     config = load_config()
@@ -52,32 +74,61 @@ class DPS_Config:
     # data
     block_size = config['data']['block_size']
     vocab_size = config['data']['vocab_size']
-    train_file = config['data']['train_file']
 
     # device
     device = config['device']['device']
     world_size = config['device']['world_size']
-    rank = config['device']['rank']
 
 class Embedding(nn.Module):
+    """
+    The embedding layer that can be computed using parallel processes
 
-    def __init__(self, vocab_size: int, num_embd: int, world_size: int, rank: int):
+    Attributes:
+        vocab_size (int): Vocabulary size.
+        num_embd (int): Number of dimensions to represent tokens
+        world_size (int): Number of processes to parallelize on
+        part_vocab_size (int): Initializes the number of tokens each process will keep in its respective vocabulary
+        vocab_start_index (int): the starting index of the current processes vocabulary allocation
+        vocab_end_index (int): the ending index of the current processes vocabulary allocation
+        weight (nn.Parameter): The embedding matrix
+    """
+    def __init__(self, vocab_size: int, num_embd: int, world_size: int):
+        """
+        Initializing the embedding layer
+
+        Args:
+            vocab_size (int): Vocabulary size.
+            num_embd (int): Number of dimensions to represent tokens
+            world_size (int): Number of processes
+        """
         super().__init__()
+
+        # initializing local variables
         self.vocab_size = vocab_size
         self.num_embd = num_embd
         self.world_size = world_size
-        self.rank = rank
 
+        # asserting that vocab_size can be equally divided by number of processes (to avoid messy calculations)
         assert self.vocab_size % self.world_size == 0, f"Vocabulary size must be divisible by world size (world_size={self.world_size})"
         self.part_vocab_size = (self.vocab_size // self.world_size)
 
-        self.vocab_start_index = self.rank * self.part_vocab_size   
+        # assigns each process an equal part of the vocabulary (defines start and end index of vocabulary for this particular process)
+        self.vocab_start_index = rank * self.part_vocab_size   
         self.vocab_end_index = self.vocab_start_index + self.part_vocab_size
 
+        # creates a weight parameter that holds the assigned part of the dictionary
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.num_embd))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward Pass of the embedding layer
 
+        Args:
+            x (torch.Tensor): input tokens
+
+        Returns: 
+            y (torch.Tensor): (vocab_size, num_embd) size tensor of token embeddings
+        """
         # splitting the embedding calculationg of parts of the vocab for this particular processor (if multiple processors)
         if self.world_size > 1:
             mask = (x < self.vocab_start_index) | (x > self.vocab_end_index)
@@ -93,18 +144,29 @@ class Embedding(nn.Module):
             dist.all_reduce(y)
 
         return y
-    
-class MLA(nn.Module):
-
-class MOE(nn.Module):
-
-class MLP(nn.Module):
 
 class RMSNorm(nn.Module):
+    """
+    Defines the RMSNorm component of the Transformer
+
+    Attributes:
+        attn(nn.Module): Attention layer using Multi-head Latent Attention (MLA)
+        ffn(nn.Module): FFN using either MLP (for dense layers) or MoE (to use experts)
+        attn_norm(nn.Module): Layer normalization before the attention
+        ffn_norm(nn.Module): Layer normalization before the ffn
+    """
+    def __init__(self, num_embd: int, eps: float = 1e-6): 
+        super().__init__()
+        self.num_embd = num_embd
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_embd))
+
+    def forward(self, x: torch.Tensor):
+        return F.rms_norm(x, (self.num_embd,), self.weight, self.eps)
+    
+class MLP(nn.Module):
 
 class OutputProjection(nn.Module):
-
-class CreateRotaryEmbeddings(nn.Module):
 
 class Block(nn.Module):
     """
@@ -174,17 +236,18 @@ class DPS(nn.Module):
 
         super().__init__()
         self.config = config
+        
 
         # creating a module dict to use keys to refer to dict values
         # dict consists of the initial up projection, the transformer blocks, the normalization, and then the down projection
         self.transformer = nn.ModuleDict(dict(
-            embed = Embedding(config.vocab_size, config.num_embd, config.world_size, config.rank), # creates the embedding
+            embed = Embedding(config.vocab_size, config.num_embd, config.world_size), # creates the embedding
             layers = nn.ModuleList([Block(i, config) for i in range(config.num_layers)]), # creates num_layers of transformer blocks
             rms_norm = RMSNorm(config.num_embd), # adds in an RMS norm at the end, after all of the transformer blocks
+            output_proj = OutputProjection(config.vocab_size, config.num_embd) # finally down projects to get final predictions
         ))
 
-        self.output_proj = OutputProjection(config.vocab_size, config.num_embd)
-        self.register_buffer("rotary_embeddings", CreateRotaryEmbeddings(self.config), persistent=False)
+        self.register_buffer("rotary_embeddings", precompute_rope_embeddings(self.config), persistent=False)
 
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
 
@@ -200,7 +263,7 @@ class DPS(nn.Module):
 
         # creates embedded tokens and rotary embeddings
         sequence_length = tokens.size(1)
-        embedded_tokens = self.embed(tokens)
+        embedded_tokens = self.transformer.embed(tokens)
         rotary_embeddings = self.rotary_embeddings[start_pos:start_pos+sequence_length]
         mask = None
 
@@ -210,20 +273,20 @@ class DPS(nn.Module):
             mask = torch.full((sequence_length, sequence_length), float("-inf"), device=tokens.device).triu_(1)
         
         # takes in the output of every layer
-        for layer in self.layers:
+        for layer in self.transformer.layers:
             embedded_tokens = layer(embedded_tokens, start_pos, rotary_embeddings, mask)
         
         # normalizes the output and down projects to logits
-        embedded_tokens = self.norm(embedded_tokens)[:, -1]
-        logits = self.output_proj(embedded_tokens)
+        embedded_tokens = self.transformer.rms_norm(embedded_tokens)[:, -1]
+        logits = self.transformer.output_proj(embedded_tokens)
 
         return logits        
     
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.bfloat16) #sets the datatype to Bfloat 16 (shortened mantissa)
-    torch.set_default_device("cuda") #sets the device to cuda
-    torch.manual_seed(0)
     config = DPS_Config() # creates a new model Config
+    torch.set_default_dtype(torch.bfloat16) #sets the datatype to Bfloat 16 (shortened mantissa)
+    torch.set_default_device(config.device)
+    torch.manual_seed(0)
     x = torch.randint(0, config.vocab_size, (2, 128)) # creates a sample tensor of random values with size (2, 128)
     model = DPS(config) # creates a model using the config
     print(model(x).size()) 

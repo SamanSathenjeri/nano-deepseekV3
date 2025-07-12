@@ -24,10 +24,7 @@ training:
 data:
    vocab_size: 30522          # number of tokens in the vocabulary
    block_size: 1024           # Context size
-   train_file: "data/wiki_small.txt" # File to train from
 
 device:
    device: "cuda"             # Device to be used for training
    world_size: 1              # how many systems are you distributing across
-   rank: 0                    # each process is numbered from 0 to world_size - 1
-
