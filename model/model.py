@@ -150,21 +150,84 @@ class RMSNorm(nn.Module):
     Defines the RMSNorm component of the Transformer
 
     Attributes:
-        attn(nn.Module): Attention layer using Multi-head Latent Attention (MLA)
-        ffn(nn.Module): FFN using either MLP (for dense layers) or MoE (to use experts)
-        attn_norm(nn.Module): Layer normalization before the attention
-        ffn_norm(nn.Module): Layer normalization before the ffn
+        num_embd(int): Number of dimensions to represent tokens
+        eps(float): a variable used to avoid division by 0 and massive inflation by a tiny sum of squares
+        weight(nn.Parameter): normalized matrix
     """
     def __init__(self, num_embd: int, eps: float = 1e-6): 
+        '''
+        Initializes the RMSNorm component
+
+        Arguments:
+            num_embd(int): Number of dimensions to represent tokens
+            eps(float): a variable used to avoid division by 0 and massive inflation by a tiny sum of squares
+        '''
         super().__init__()
         self.num_embd = num_embd
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(num_embd))
 
     def forward(self, x: torch.Tensor):
+        '''
+        Forward Pass of the RMSNorm component
+
+        Arguments:
+            x(torch.Tensor):
+
+        Returns:
+            torch.Tensor:
+        '''
         return F.rms_norm(x, (self.num_embd,), self.weight, self.eps)
     
 class MLP(nn.Module):
+    '''
+    Defines the MLP component of the FFN 
+
+    Attributes:
+        num_embd(int): Number of dimensions to represent tokens
+        intermediate_size(int): Intermediate dimension 
+        layer1(nn.Linear): Linear layer that up-projects from num_embd to intermediate_size (to be used in silu)
+        layer2(nn.Linear): Linear layer to down-project from intermediate_size to num_embd
+        layer3(nn.Linear): Linear layer that acts as gating mechanism for layer 1 - also projects from num_embd to intermediate_size
+    '''
+
+    def __init__(self, num_embd: int, intermediate_size: int):
+        '''
+        Initializes the MLP component
+
+        Attributes:
+            num_embd(int): Number of dimensions to represent tokens
+            intermediate_size(int): Intermediate dimension 
+        '''
+        self.num_embd = num_embd
+        self.intermediate_size = intermediate_size
+
+        '''
+        !!!more about the SWiGLU gating mechanism!!!
+        the output from silu(layer1(x)) is a nonlinear activation 
+        the output from layer3(x) is the raw output from the linear layer's transformations
+        they are element-wise multiplied where the layer3(x)'s output acts as a "gate" for the output from silu(layer1(x))
+        what happens is if the activations from layer3(x) is high, then it will amplify the corresponding feature from the silu
+        else, if the activation from the layer3(x) is low, then it will diminish and "close the gate" of the corresponding 
+        feature from the silu - this allows us highlight or hide certain features based on what our input is
+        '''
+        
+        self.layer1 = nn.Linear(self.num_embd, self.intermediate_size) # Sets up linear layer to use SiLU
+        self.layer2 = nn.Linear(self.intermediate_size, self.num_embd) # Sets up linear layer to project back to num_embd dimensions
+        self.layer3 = nn.Linear(self.num_embd, self.intermediate_size) # Sets up linear layer to be used in SWiGLU gating mechanism
+
+    def forward(self, x: torch.Tensor):
+        '''
+        Forward Pass of the MLP layer
+        
+        Arguments:
+            x(torch.Tensor): input tensor
+            
+        Returns:
+            torch.Tensor: output tensor after MLP operations
+        '''
+        return self.layer2(F.silu(self.layer1(x)) * self.layer3(x))
+        
 
 class OutputProjection(nn.Module):
 
