@@ -9,7 +9,6 @@ import torch.distributed as dist
 
 from utils import load_config
 from MLA import MLA
-from MOE import MOE
 from RoPE import precompute_rope_embeddings
 # import sys
 
@@ -21,30 +20,7 @@ class DPS_Config:
     Defines model hyperparameters and arguments from config.yaml file
 
     Attributes:
-        num_embd(int) = Number of dimensions to represent tokens
-        num_layers(int) = Number of transformer blocks
-        num_dense_layers(int) = Number of dense layers in the model (layers before we send to MoE)
-        num_attention_heads(int) = Number of attention heads
-        intermediate_size(int) = Intermediate dimension for MLP layers
         
-        latent_dim(int) = 
-        proj_matrix_size(int) = 
-
-        num_experts(int) = 
-        num_activated(int) = 
-        expert_inter_size(int) = 
-
-        batch_size(int) = 
-        num_epochs(int) = 
-        learning_rate(int) = 
-        warmup_steps(int) = 
-        num_predicted_tokens(int) = 
-
-        block_size(int) = Context size
-        vocab_size(int) = Vocabulary size
-
-        device(string) = the device to train on ("cuda", "cpu", etc...)
-        world_size(int) = the number of processes running in parallel
     """
 
     config = load_config()
@@ -58,11 +34,29 @@ class DPS_Config:
     # MLA
     latent_dim = config['model']['latent_dim']
     proj_matrix_size = config['model']['proj_matrix_size']
+    q_lora_rank = config['model']['q_lora_rank']
+    kv_lora_rank = config['model']['kv_lora_rank']
+    qk_nope_head_dim = config['model']['qk_nope_head_dim']
+    qk_rope_head_dim = config['model']['qk_rope_head_dim']
+    v_head_dim = config['model']['v_head_dim']
 
     # MoE
     num_experts = config['model']['num_experts']
+    num_shared_experts = config['model']['num_shared_experts']
     num_activated_experts = config['model']['num_activated_experts']
     expert_inter_size = config['model']['expert_inter_size']
+    n_expert_groups = config['model']['n_expert_groups']
+    n_limited_groups = config['model']['n_limited_groups']
+    route_scale = config['model']['route_scale']
+    score_function = config['model']['score_function']
+
+    # RoPE
+    original_seq_len = config['model']['original_seq_len']
+    rope_theta = config['model']['rope_theta']
+    rope_factor = config['model']['rope_factor']
+    beta_fast = config['model']['beta_fast']
+    beta_slow = config['model']['beta_slow']
+    mscale = config['model']['mscale']
 
     # training
     batch_size = config['training']['batch_size']
@@ -70,10 +64,12 @@ class DPS_Config:
     learning_rate = config['training']['learning_rate']
     warmup_steps = config['training']['warmup_steps']
     num_predicted_tokens = config['training']['num_predicted_tokens']
+    max_seq_len = config['training']['max_seq_len']
 
     # data
     block_size = config['data']['block_size']
     vocab_size = config['data']['vocab_size']
+    dtype = config['data']['dtype']
 
     # device
     device = config['device']['device']
@@ -227,10 +223,37 @@ class MLP(nn.Module):
             torch.Tensor: output tensor after MLP operations
         '''
         return self.layer2(F.silu(self.layer1(x)) * self.layer3(x))
+    
+class Router(nn.Module):
+
+    def __init__(self):
+
+    def forward():
         
 
-class OutputProjection(nn.Module):
+class Expert(nn.Module):
 
+    def __init__():
+
+    def forward():
+        
+
+class MOE(nn.Module): 
+    '''
+    The mixture of experts module which will allow for the routing to different experts
+    '''
+    def __init__(self, config: DPS_Config):
+        self.num_experts = config.num_experts
+        self.num_activated_experts = config.num_activated_experts
+        self.expert_inter_size = config.expert_inter_size
+        self.num_shared_experts = config.num_shared_experts
+        self.n_expert_groups = config.n_expert_groups
+        self.n_limited_groups = config.n_limited_groups
+        self.route_scale = config.route_scale
+
+    def forward():
+
+        
 class Block(nn.Module):
     """
     Defines Transformer Block architecture
@@ -299,7 +322,6 @@ class DPS(nn.Module):
 
         super().__init__()
         self.config = config
-        
 
         # creating a module dict to use keys to refer to dict values
         # dict consists of the initial up projection, the transformer blocks, the normalization, and then the down projection
@@ -307,7 +329,7 @@ class DPS(nn.Module):
             embed = Embedding(config.vocab_size, config.num_embd, config.world_size), # creates the embedding
             layers = nn.ModuleList([Block(i, config) for i in range(config.num_layers)]), # creates num_layers of transformer blocks
             rms_norm = RMSNorm(config.num_embd), # adds in an RMS norm at the end, after all of the transformer blocks
-            output_proj = OutputProjection(config.vocab_size, config.num_embd) # finally down projects to get final predictions
+            output_proj = nn.Linear(config.num_embd, config.vocab_size) # finally down projects to get final predictions
         ))
 
         self.register_buffer("rotary_embeddings", precompute_rope_embeddings(self.config), persistent=False)

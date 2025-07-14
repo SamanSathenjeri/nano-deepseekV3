@@ -8,22 +8,42 @@ model:
    # MLA
    latent_dim: 16             # Dimension of the compressed latent space (head dim//2 or 4)
    proj_matrix_size: 256      # the proj matrices to up and down project
+   q_lora_rank: 0             # LoRA rank for query projections.
+   kv_lora_rank: 512          # LoRA rank for key-value projections.
+   qk_nope_head_dim: 128      # Dimension for query-key projections without positional embeddings.
+   qk_rope_head_dim: 64       # Dimension for query-key projections with rotary embeddings.
+   v_head_dim: 128            # Dimension for value projections.
 
-   # MOE
+   # MoE
    num_experts: 16            # Total number of routed experts per MoE layer
+   num_shared_experts: 1      # Number of experts that get activated no matter the token
    num_activated_experts: 2   # K: num of experts activated per token
    expert_inter_size: 1024    # Intermediate size for each expert's FFN (intermediate_size/num_experts * 2)
+   n_expert_groups: 1         # Number of groups experts are grouped in
+   n_limited_groups: 1        # Number of experts per group
+   route_scale: 1             # Scaling factor per route
+   score_function: "sigmoid"  # The scoring function used to determine what expert/s to route to in MOE
+
+   # RoPE
+   original_seq_len: 1024     # Original sequence length.
+   rope_theta: 10000.0        # Base for rotary positional encoding.
+   rope_factor: 40            # Scaling factor for extended sequence lengths.
+   beta_fast: 32              # Fast beta correction factor.
+   beta_slow: 1               # Slow beta correction factor.
+   mscale: 1                  # Scaling factor for extended attention.
 
 training:
-   batch_size: 16             # Number of batches trained at the same time
+   max_batch_size: 16         # Maximum number of batches trained at the same time
    num_epochs: 10             # number of complete passes through the dataset
    learning_rate: 0.0003      # learning rate for training
    warmup_steps: 1000         # starting steps with low learning rate
    num_predicted_tokens: 2    # number of future tokens that are simultaneously predicted
+   max_seq_len: 1024          # Maximum sequence length.
 
 data:
    vocab_size: 30522          # number of tokens in the vocabulary
-   block_size: 1024           # Context size
+   max_seq_len: 1024          # Context size
+   dtype: "bf16"              # Data type to represent floats
 
 device:
    device: "cuda"             # Device to be used for training
