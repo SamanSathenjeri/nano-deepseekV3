@@ -9,7 +9,7 @@ model:
    latent_dim: 16             # Dimension of the compressed latent space (head dim//2 or 4)
    proj_matrix_size: 256      # the proj matrices to up and down project
    q_lora_rank: 0             # LoRA rank for query projections.
-   kv_lora_rank: 512          # LoRA rank for key-value projections.
+   kv_lora_rank: 0            # LoRA rank for key-value projections.
    qk_nope_head_dim: 128      # Dimension for query-key projections without positional embeddings.
    qk_rope_head_dim: 64       # Dimension for query-key projections with rotary embeddings.
    v_head_dim: 128            # Dimension for value projections.
@@ -46,5 +46,5 @@ data:
    dtype: "bf16"              # Data type to represent floats
 
 device:
-   device: "cuda"             # Device to be used for training
+   device: "cpu"             # Device to be used for training
    world_size: 1              # how many systems are you distributing across

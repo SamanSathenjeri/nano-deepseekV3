@@ -8,11 +8,10 @@ from torch.nn import functional as F
 import torch.distributed as dist
 
 from utils import load_config
-from MLA import MLA
-from RoPE import precompute_rope_embeddings
 # import sys
 
 # rank = 0
+attn_impl = "absorb"
 
 @dataclass
 class DPS_Config:
@@ -108,7 +107,7 @@ class DPS_Config:
     mscale = config['model']['mscale']
 
     # training
-    batch_size = config['training']['batch_size']
+    max_batch_size = config['training']['max_batch_size']
     num_epochs = config['training']['num_epochs']
     learning_rate = config['training']['learning_rate']
     warmup_steps = config['training']['warmup_steps']
@@ -116,13 +115,100 @@ class DPS_Config:
     max_seq_len = config['training']['max_seq_len']
 
     # data
-    block_size = config['data']['block_size']
+    # block_size = config['data']['max_seq_len']
     vocab_size = config['data']['vocab_size']
     dtype = config['data']['dtype']
 
     # device
     device = config['device']['device']
     world_size = config['device']['world_size']
+
+def precompute_rope_embeddings(config: DPS_Config) -> torch.Tensor:
+
+    rope_dim = config.qk_rope_head_dim
+    max_seq_len = config.max_seq_len
+    beta_fast = config.beta_fast
+    beta_slow = config.beta_slow
+    rope_theta = config.rope_theta
+    rope_factor = config.rope_factor
+    original_seq_len = config.original_seq_len
+    device = config.device
+
+    """
+    Precomputes softened rotary positional embedding frequencies (complex exponentials).
+
+    This version supports extrapolation smoothing like DeepSeek-V3.
+
+    Returns:
+        freqs_cis: [seq_len, rope_dim // 2], complex tensor of frequency rotations.
+    """
+
+    def find_correction_dim(num_rotations, dim, base, max_seq_len):
+        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(min_idx, max_idx, dim):
+        if min_idx == max_idx:
+            max_idx += 1e-3  # prevent divide-by-zero
+        ramp = (torch.arange(dim, dtype=torch.float32, device=device) - min_idx) / (max_idx - min_idx)
+        return torch.clamp(ramp, 0, 1)
+
+    assert rope_dim % 2 == 0, "Dimension must be divisible by 2"
+    
+    # creates the angles
+    # creates the basic arange array then multiplies
+    # then conducts the polar operation
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim))
+
+    # Softening adjustment for long context
+    if max_seq_len > original_seq_len:
+        low, high = find_correction_range(beta_fast, beta_slow, rope_dim, rope_theta, original_seq_len)
+        smooth = 1.0 - linear_ramp_factor(low, high, rope_dim // 2)
+        inv_freq_soft = inv_freq / rope_factor
+        inv_freq = inv_freq_soft * (1 - smooth) + inv_freq * smooth  # blend frequencies
+
+    base_tensor = torch.arange(max_seq_len, device=device, dtype=inv_freq.dtype) # Use max_seq_len for positions
+    freqs = torch.outer(base_tensor, inv_freq)
+    freqs = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs
+
+def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    q, k: [B, T, H, D]
+    freqs_cis: [T, D // 2] (complex)
+    """
+    # Use q_dtype and k_dtype if they can differ, otherwise just one dtype for consistency
+    q_dtype = q.dtype
+    k_dtype = k.dtype
+    B, T, H, D = q.shape # Assuming q and k have the same shape
+
+    assert D % 2 == 0, f"Last dim {D} must be even to form complex pairs"
+    D_half = D // 2
+
+    # --- Process Q ---
+    q_reshaped = q.float().view(B, T, H, D_half, 2)
+    q_complex = torch.view_as_complex(q_reshaped)
+
+    # --- Process K ---
+    k_reshaped = k.float().view(B, T, H, D_half, 2)
+    k_complex = torch.view_as_complex(k_reshaped)
+
+    # Prepare freqs_cis (same for both q and k)
+    freqs_cis = freqs_cis.view(1, T, 1, D_half)
+
+    # Complex multiplication
+    q_rotated = q_complex * freqs_cis
+    k_rotated = k_complex * freqs_cis
+
+    # Convert back to real
+    q_out = torch.view_as_real(q_rotated).view(B, T, H, D)
+    k_out = torch.view_as_real(k_rotated).view(B, T, H, D)
+
+    return q_out.to(q_dtype), k_out.to(k_dtype)
 
 class Embedding(nn.Module):
     """
@@ -278,7 +364,7 @@ class Router(nn.Module):
         Returns:
             torch.Tensor: returns x with routing information
         '''
-        scores = MLP(x, self.weight)
+        scores = F.linear(x, self.weight, self.bias)
         scores = scores.softmax(dim=-1, dtype=torch.float32) if self.score_function == "softmax" else scores.sigmoid()
         original_scores = scores
 
@@ -292,10 +378,10 @@ class Router(nn.Module):
         #     mask = scores.new_ones(x.size(0), self.num_expert_groups, dtype=bool).scatter_(1, indices, False)
         #     scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
         
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        indices = torch.topk(scores, self.num_activated_experts, dim=-1)[1]
         weights = original_scores.gather(1, indices)
 
-        if self.score_func == "sigmoid":
+        if self.score_function == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
 
         weights *= self.route_scale
@@ -318,6 +404,7 @@ class MOE(nn.Module):
             config(DPS_Config): holds the model's hyperparameters
         '''
         super().__init__()
+        self.config = config
         self.router = Router(config)
         self.experts = nn.ModuleList([MLP(config.num_embd, config.expert_inter_size) for i in range(config.num_experts)])
         self.shared_experts = MLP(config.num_embd, config.num_shared_experts * config.expert_inter_size)
@@ -334,7 +421,7 @@ class MOE(nn.Module):
         '''
 
         shape = x.size() # Storing original shape to use in return statement
-        x = x.view(-1, self.dim) 
+        x = x.view(-1, config.num_embd) 
         weights, indices = self.router(x)
         y = torch.zeros_like(x)
 
@@ -347,6 +434,61 @@ class MOE(nn.Module):
 
         z = self.shared_experts(x)
         return (y + z).view(shape)
+
+class MLA(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim = config.num_embd
+        self.n_heads = config.num_attention_heads
+        self.latent_dim = config.latent_dim  # e.g. 16
+        self.head_dim = self.dim // self.n_heads
+        assert self.dim % self.n_heads == 0, "Embedding dim must be divisible by number of heads"
+
+        self.q_proj = nn.Linear(self.dim, self.dim)
+        self.k_proj = nn.Linear(self.dim, self.dim)
+        self.v_proj = nn.Linear(self.dim, self.dim)
+        self.out_proj = nn.Linear(self.dim, self.dim)
+
+        # Latent compression: reduce head_dim to latent_dim
+        self.compress_q = nn.Linear(self.head_dim, self.latent_dim)
+        self.compress_k = nn.Linear(self.head_dim, self.latent_dim)
+        self.compress_v = nn.Linear(self.head_dim, self.latent_dim)
+
+        # Latent decompression: bring it back to head_dim
+        self.decompress = nn.Linear(self.latent_dim, self.head_dim)
+
+        self.softmax_scale = 1.0 / math.sqrt(self.latent_dim)
+
+    def forward(self, x: torch.Tensor, start_pos=0, freqs_cis=None, mask=None):
+        B, T, D = x.size()
+        H = self.n_heads
+        Hd = self.head_dim
+
+        q = self.q_proj(x).view(B, T, H, Hd)
+        k = self.k_proj(x).view(B, T, H, Hd)
+        v = self.v_proj(x).view(B, T, H, Hd)
+
+        # Slice rotary embeddings to current sequence length T
+        if freqs_cis is not None:
+            freqs_cis = freqs_cis[start_pos : start_pos + T, :]
+
+        q, k = apply_rope_embeddings(q, k, freqs_cis)
+        q_latent = self.compress_q(q)
+        k_latent = self.compress_k(k)
+        v_latent = self.compress_v(v)
+
+        scores = torch.einsum("bTHl,bSHl->bHTS", q_latent, k_latent) * self.softmax_scale
+
+        if mask is not None:
+            expanded_mask = mask.unsqueeze(0).unsqueeze(0)
+            scores += expanded_mask
+
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_output = torch.einsum("bhts,bshl->bthl", attn_weights, v_latent)
+
+        attn_output = self.decompress(attn_output)
+        attn_output = attn_output.contiguous().view(B, T, D)
+        return self.out_proj(attn_output)
         
 class Block(nn.Module):
     """
@@ -426,7 +568,7 @@ class DPS(nn.Module):
             output_proj = nn.Linear(config.num_embd, config.vocab_size) # finally down projects to get final predictions
         ))
 
-        self.register_buffer("rotary_embeddings", precompute_rope_embeddings(self.config), persistent=False)
+        self.register_buffer("rotary_embeddings", precompute_rope_embeddings(config), persistent=False)
 
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
 
@@ -444,7 +586,7 @@ class DPS(nn.Module):
         # creates embedded tokens and rotary embeddings
         sequence_length = tokens.size(1)
         embedded_tokens = self.transformer.embed(tokens)
-        rotary_embeddings = self.rotary_embeddings[start_pos:start_pos+sequence_length]
+        rotary_embeddings = self.rotary_embeddings[start_pos : start_pos + sequence_length]
         mask = None
 
         # creates mask of upper triangle with -inf elements, if sequence length is above the trivial amount of 1
@@ -470,3 +612,16 @@ if __name__ == "__main__":
     x = torch.randint(0, config.vocab_size, (2, 128)) # creates a sample tensor of random values with size (2, 128)
     model = DPS(config) # creates a model using the config
     print(model(x).size()) 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+
+    for epoch in range(config.num_epochs):
+        x = torch.randint(0, config.vocab_size, (config.max_batch_size, config.max_seq_len), device=config.device)
+        y = x[:, -1]
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        print(f"Epoch {epoch+1}/{config.num_epochs}, Loss: {loss.item():.4f}")
