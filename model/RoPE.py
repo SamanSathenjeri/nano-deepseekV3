@@ -52,6 +52,9 @@ def precompute_rope_embeddings(config: DPS_Config) -> torch.Tensor:
         inv_freq_soft = inv_freq / rope_factor
         inv_freq = inv_freq_soft * (1 - smooth) + inv_freq * smooth  # blend frequencies
 
+        # explanation of this softening
+        
+
     base_tensor = torch.arange(rope_dim, device=device).type_as(inv_freq)
     freqs = torch.outer(base_tensor, inv_freq)
     freqs = torch.polar(torch.ones_like(freqs), freqs)

@@ -25,12 +25,12 @@ model:
    score_function: "sigmoid"  # The scoring function used to determine what expert/s to route to in MOE
 
    # RoPE
-   original_seq_len: 1024     # Original sequence length.
-   rope_theta: 10000.0        # Base for rotary positional encoding.
-   rope_factor: 40            # Scaling factor for extended sequence lengths.
-   beta_fast: 32              # Fast beta correction factor.
-   beta_slow: 1               # Slow beta correction factor.
-   mscale: 1                  # Scaling factor for extended attention.
+   original_seq_len: 1024     # Original sequence length
+   rope_theta: 10000.0        # Base for rotary positional encoding
+   rope_factor: 40            # Scaling factor for extended sequence lengths
+   beta_fast: 32              # Fast beta correction factor
+   beta_slow: 1               # Slow beta correction factor
+   mscale: 1                  # Scaling factor for extended attention
 
 training:
    max_batch_size: 16         # Maximum number of batches trained at the same time
