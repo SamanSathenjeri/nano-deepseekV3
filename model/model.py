@@ -153,7 +153,7 @@ def precompute_rope_embeddings(config: DPS_Config) -> torch.Tensor:
 
     def linear_ramp_factor(min_idx, max_idx, dim):
         if min_idx == max_idx:
-            max_idx += 1e-3  # prevent divide-by-zero
+            max_idx = max_idx + 1e-3  # prevent divide-by-zero
         ramp = (torch.arange(dim, dtype=torch.float32, device=device) - min_idx) / (max_idx - min_idx)
         return torch.clamp(ramp, 0, 1)
 
@@ -188,6 +188,9 @@ def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Ten
 
     assert D % 2 == 0, f"Last dim {D} must be even to form complex pairs"
     D_half = D // 2
+
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
 
     # --- Process Q ---
     q_reshaped = q.float().view(B, T, H, D_half, 2)
@@ -354,6 +357,12 @@ class Router(nn.Module):
         self.weight = nn.Parameter(torch.empty(config.num_experts, config.num_embd))
         self.bias = nn.Parameter(torch.empty(config.num_experts)) if self.num_embd == 1024 else None
 
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         '''
         The forward pass of the Router component
@@ -368,9 +377,6 @@ class Router(nn.Module):
         scores = scores.softmax(dim=-1, dtype=torch.float32) if self.score_function == "softmax" else scores.sigmoid()
         original_scores = scores
 
-        if self.bias is not None:
-            scores = scores + self.bias
-
         # if self.num_expert_groups > 1:
         #     scores = scores.view(x.size(0), self.num_expert_groups, -1)
         #     group_scores = scores.amax(dim=-1) if self.bias is None else scores.topk(2, dim=-1)[0].sum(dim=-1)
@@ -382,9 +388,9 @@ class Router(nn.Module):
         weights = original_scores.gather(1, indices)
 
         if self.score_function == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
 
-        weights *= self.route_scale
+        weights = weights * self.route_scale
         return weights.type_as(x), indices
 
 class MOE(nn.Module): 
@@ -421,7 +427,7 @@ class MOE(nn.Module):
         '''
 
         shape = x.size() # Storing original shape to use in return statement
-        x = x.view(-1, config.num_embd) 
+        x = x.view(-1, self.config.num_embd) 
         weights, indices = self.router(x)
         y = torch.zeros_like(x)
 
@@ -430,7 +436,7 @@ class MOE(nn.Module):
                 expert_idx = indices[index, top].item()
                 weight = weights[index, top]
                 expert = self.experts[expert_idx]
-                y[index] += expert(x[index].unsqueeze(0)).squeeze(0) * weight
+                y[index] = y[index] + expert(x[index].unsqueeze(0)).squeeze(0) * weight
 
         z = self.shared_experts(x)
         return (y + z).view(shape)
@@ -481,7 +487,7 @@ class MLA(nn.Module):
 
         if mask is not None:
             expanded_mask = mask.unsqueeze(0).unsqueeze(0)
-            scores += expanded_mask
+            scores = scores + expanded_mask
 
         attn_weights = F.softmax(scores, dim=-1)
         attn_output = torch.einsum("bhts,bshl->bthl", attn_weights, v_latent)
@@ -569,6 +575,7 @@ class DPS(nn.Module):
         ))
 
         self.register_buffer("rotary_embeddings", precompute_rope_embeddings(config), persistent=False)
+        print("Done Initializing Model")
 
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
 
@@ -590,38 +597,28 @@ class DPS(nn.Module):
         mask = None
 
         # creates mask of upper triangle with -inf elements, if sequence length is above the trivial amount of 1
-        # to avoid the model from using future tokens to help it calculate the attention (the triu_ is an upper triangle mask and is an inplace operation)
+        # to avoid the model from using future tokens to help it calculate the attention (the triu_ is an upper triangle mask)
         if sequence_length > 1:
-            mask = torch.full((sequence_length, sequence_length), float("-inf"), device=tokens.device).triu_(1)
+            mask = torch.full((sequence_length, sequence_length), float("-inf"), device=tokens.device).triu(1)
         
         # takes in the output of every layer
         for layer in self.transformer.layers:
             embedded_tokens = layer(embedded_tokens, start_pos, rotary_embeddings, mask)
         
         # normalizes the output and down projects to logits
-        embedded_tokens = self.transformer.rms_norm(embedded_tokens)[:, -1]
+        embedded_tokens = self.transformer.rms_norm(embedded_tokens)
         logits = self.transformer.output_proj(embedded_tokens)
+        # print("Done calculating logits")
 
         return logits        
     
 if __name__ == "__main__":
     config = DPS_Config() # creates a new model Config
-    torch.set_default_dtype(torch.bfloat16) #sets the datatype to Bfloat 16 (shortened mantissa)
+    # torch.set_default_dtype(torch.bfloat16) #sets the datatype to Bfloat 16 (shortened mantissa)
+    torch.set_default_dtype(torch.float32)
     torch.set_default_device(config.device)
     torch.manual_seed(0)
     x = torch.randint(0, config.vocab_size, (2, 128)) # creates a sample tensor of random values with size (2, 128)
     model = DPS(config) # creates a model using the config
     print(model(x).size()) 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-
-    for epoch in range(config.num_epochs):
-        x = torch.randint(0, config.vocab_size, (config.max_batch_size, config.max_seq_len), device=config.device)
-        y = x[:, -1]
-        logits = model(x)
-        loss = F.cross_entropy(logits, y)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        print(f"Epoch {epoch+1}/{config.num_epochs}, Loss: {loss.item():.4f}")
