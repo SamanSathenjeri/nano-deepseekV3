@@ -10,22 +10,18 @@ import random
 
 from model import DPS, DPS_Config
 
-# ✅ Config
-MODEL_NAME = "gpt2"
 MAX_LENGTH = 1024
-TRAIN_EXAMPLES = 2500   # Increase this to 100k+ later
+TRAIN_EXAMPLES = 2500
 VAL_EXAMPLES = 5000
-BATCH_SIZE = 2  # Adjust based on memory
+BATCH_SIZE = 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LEARNING_RATE = 1e-4
 EPOCHS = 100
 EVAL_EVERY = 5
 LOG_PATH = "training_log.json"
-MODEL_SAVE_DIR = "dps_models"
-os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
+os.makedirs("dps_models", exist_ok=True)
 
-# ✅ Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
 # ✅ Custom IterableDataset with shuffle and chunking
 class TokenChunkDataset(IterableDataset):

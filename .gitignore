@@ -2,3 +2,5 @@ myenv
 hyperparam.txt
 __init__.py
 backup
+tokenized_tinystories
+tokenized_tinystories.zip

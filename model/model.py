@@ -189,19 +189,25 @@ def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Ten
     assert D % 2 == 0, f"Last dim {D} must be even to form complex pairs"
     D_half = D // 2
 
+    # D = num_embd/num_heads = 384/6 = 64
+    # print(freqs_cis.shape)
+
     q = q.to(torch.float32)
     k = k.to(torch.float32)
 
     # --- Process Q ---
     q_reshaped = q.float().view(B, T, H, D_half, 2)
     q_complex = torch.view_as_complex(q_reshaped)
+    # print(q_complex.shape)
 
     # --- Process K ---
     k_reshaped = k.float().view(B, T, H, D_half, 2)
     k_complex = torch.view_as_complex(k_reshaped)
 
     # Prepare freqs_cis (same for both q and k)
-    freqs_cis = freqs_cis.view(1, T, 1, D_half)
+    D_half = freqs_cis.shape[-1]
+    freqs_cis = freqs_cis[:T].view(1, T, 1, D_half)
+    # print(freqs_cis.shape)
 
     # Complex multiplication
     q_rotated = q_complex * freqs_cis
@@ -574,6 +580,7 @@ class DPS(nn.Module):
             output_proj = nn.Linear(config.num_embd, config.vocab_size) # finally down projects to get final predictions
         ))
 
+        # print("DEBUG: max_seq_len used to create rotary embeddings:", config.max_seq_len)
         self.register_buffer("rotary_embeddings", precompute_rope_embeddings(config), persistent=False)
         print("Done Initializing Model")
 

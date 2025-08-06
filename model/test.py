@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
@@ -17,7 +17,7 @@ checkpoint_dir = './checkpoints'
 os.makedirs(checkpoint_dir, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-tokenizer = AutoTokenizer.from_pretrained("gpt2")  # or custom
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
 def tokenize_function(example):
@@ -28,7 +28,20 @@ def tokenize_function(example):
     }
 
 raw_dataset = load_dataset("roneneldan/TinyStories", split="train")
-tokenized_dataset = raw_dataset.map(tokenize_function)
+
+if os.path.exists("tokenized_tinystories"):
+    tokenized_dataset = load_from_disk("tokenized_tinystories")
+else:
+    tokenized_dataset = raw_dataset.map(tokenize_function)
+    tokenized_dataset.save_to_disk("tokenized_tinystories")
+
+def format_for_torch(example):
+    return {
+        "input_ids": torch.tensor(example["input_ids"]),
+        "labels": torch.tensor(example["input_ids"])
+    }
+
+tokenized_dataset.set_transform(format_for_torch)
 
 train_size = int(0.9 * len(tokenized_dataset))
 val_size = len(tokenized_dataset) - train_size
@@ -38,6 +51,7 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
 from model import DPS, DPS_Config
+
 config = DPS_Config()
 config.max_batch_size = batch_size
 config.learning_rate = learning_rate
