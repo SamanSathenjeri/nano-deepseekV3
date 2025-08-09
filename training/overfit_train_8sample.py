@@ -6,21 +6,19 @@ import matplotlib.pyplot as plt
 
 from model import DPS, DPS_Config
 
-# --- Configuration ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Hyperparameters
 seq_len = 128
 batch_size = 4
 num_epochs = 100
 print_interval = 10
-plot_path = "small_batch_loss_curve.png"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Load small data subset ---
+# Tokenizer Setup
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:8]")
-
-# --- Tokenizer ---
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
+# Dataset Loading
 def tokenize_fn(example):
     return tokenizer(
         example["text"],
@@ -30,24 +28,22 @@ def tokenize_fn(example):
     )
 
 dataset = dataset.map(tokenize_fn, remove_columns=["text"])
-input_ids = torch.tensor(dataset["input_ids"])  # [8, seq_len]
+input_ids = torch.tensor(dataset["input_ids"])
 labels = input_ids.clone()
 
-# --- Build DataLoader ---
 dataset_tensor = torch.utils.data.TensorDataset(input_ids, labels)
 loader = torch.utils.data.DataLoader(dataset_tensor, batch_size=batch_size, shuffle=True)
 
-# --- Model Setup ---
+# Model Initialization
 config = DPS_Config()
 config.vocab_size = tokenizer.vocab_size 
 config.max_seq_len = seq_len
 model = DPS(config).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-# --- Training Loop ---
 train_losses = []
 
-print("\n🧪 Starting Overfit on Small Batch")
+# Training loop
 for epoch in range(1, num_epochs + 1):
     model.train()
     epoch_loss = 0.0
@@ -70,7 +66,6 @@ for epoch in range(1, num_epochs + 1):
     if epoch % print_interval == 0 or epoch == 1:
         print(f"Epoch {epoch:03d} | Train Loss: {avg_loss:.4f}")
 
-# --- Plot Loss Curve ---
 plt.figure(figsize=(8, 4))
 plt.plot(train_losses, label="Train Loss")
 plt.xlabel("Epoch")
@@ -78,11 +73,9 @@ plt.ylabel("Loss")
 plt.title("Overfitting Small Batch")
 plt.grid(True)
 plt.legend()
-plt.savefig(plot_path)
+plt.savefig("small_batch_loss_curve.png")
 plt.close()
-print(f"\n📈 Loss curve saved to {plot_path}")
 
-# --- Evaluation on Batch ---
 model.eval()
 with torch.no_grad():
     x_batch, y_batch = next(iter(loader))
@@ -96,8 +89,6 @@ with torch.no_grad():
         pred_txt = tokenizer.decode(predicted_ids[i], skip_special_tokens=True)
 
         print(f"\n--- Sample {i+1} ---")
-        print("🔎 Input:\n", input_txt[:200], "...")
-        print("🎯 Target:\n", target_txt[:200], "...")
-        print("🤖 Prediction:\n", pred_txt[:200], "...")
-
-print("\n✅ Overfitting small batch finished!")
+        print("Input:\n", input_txt[:200], "...")
+        print("Target:\n", target_txt[:200], "...")
+        print("Prediction:\n", pred_txt[:200], "...")

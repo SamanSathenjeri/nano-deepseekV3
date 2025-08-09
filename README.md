@@ -48,17 +48,17 @@ model:
    num_embd: 128              # number of dimensions to represent the token
    num_layers: 6              # number of transformer blocks
    num_dense_layers: 2        # First N layers which are dense
-   num_attention_heads: 6     # Number of attention heads per block (head_dimension = num_embd//num_attention heads)
+   num_attention_heads: 4     # Number of attention heads per block (head_dimension = num_embd//num_attention heads)
    intermediate_size: 512     # Overall FeedForward dim size (4 * n_embd)
 
    # MLA
-   latent_dim: 8              # Dimension of the compressed latent space (head dim//2 or 4)
-   proj_matrix_size: 128      # the proj matrices to up and down project
+   latent_dim: 4              # Dimension of the compressed latent space (head dim//2 or 4)
+   proj_matrix_size: 64       # the proj matrices to up and down project
    q_lora_rank: 0             # LoRA rank for query projections.
    kv_lora_rank: 0            # LoRA rank for key-value projections.
-   qk_nope_head_dim: 64       # Dimension for query-key projections without positional embeddings.
-   qk_rope_head_dim: 64       # Dimension for query-key projections with rotary embeddings.
-   v_head_dim: 64             # Dimension for value projections.
+   qk_nope_head_dim: 32       # Dimension for query-key projections without positional embeddings.
+   qk_rope_head_dim: 32       # Dimension for query-key projections with rotary embeddings.
+   v_head_dim: 32             # Dimension for value projections.
 
    # MoE
    num_experts: 4             # Total number of routed experts per MoE layer
@@ -98,7 +98,7 @@ device:
 
 ##### Usage:
 
-How to train the nano-DeepseekV3 model?
+How to train the nano-DeepseekV3 model on the TinyStories Dataset?
 > python model/train.py
 
 How to run this model?

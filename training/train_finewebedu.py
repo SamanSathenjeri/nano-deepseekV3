@@ -39,12 +39,12 @@ def tokenize_function(example):
         "labels": tokens["input_ids"]
     }
 
-if os.path.exists("tokenized_tinystories"):
-    tokenized_dataset = load_from_disk("tokenized_tinystories")
+if os.path.exists("tokenized_fineweb"):
+    tokenized_dataset = load_from_disk("tokenized_fineweb")
 else:
-    raw_dataset = load_dataset("roneneldan/TinyStories", split="train")
+    raw_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
     tokenized_dataset = raw_dataset.map(tokenize_function, remove_columns=["text"])
-    tokenized_dataset.save_to_disk("tokenized_tinystories")
+    tokenized_dataset.save_to_disk("tokenized_fineweb")
 
 def format_for_torch(example):
     return {

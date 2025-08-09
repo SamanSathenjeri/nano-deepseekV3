@@ -1,17 +1,10 @@
 import math
+import torch # type: ignore
+import torch.nn as nn # type: ignore
+from torch.nn import functional as F # type: ignore
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
-
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import torch.distributed as dist
-
+from typing import Optional
 from utils import load_config
-# import sys
-
-# rank = 0
-attn_impl = "absorb"
 
 @dataclass
 class DPS_Config:
@@ -178,6 +171,8 @@ def precompute_rope_embeddings(config: DPS_Config) -> torch.Tensor:
 
 def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
+    Applies rope embeddings to query and key vectors
+    
     q, k: [B, T, H, D]
     freqs_cis: [T, D // 2] (complex)
     """
@@ -380,9 +375,10 @@ class Router(nn.Module):
             torch.Tensor: returns x with routing information
         '''
         scores = F.linear(x, self.weight, self.bias)
-        scores = scores.softmax(dim=-1, dtype=torch.float32) if self.score_function == "softmax" else scores.sigmoid()
+        scores = scores.softmax(dim=-1) if self.score_function == "softmax" else scores.sigmoid()
         original_scores = scores
 
+        # NOTE: SMALL MODEL, SO NO EXPERT GROUPS ***************
         # if self.num_expert_groups > 1:
         #     scores = scores.view(x.size(0), self.num_expert_groups, -1)
         #     group_scores = scores.amax(dim=-1) if self.bias is None else scores.topk(2, dim=-1)[0].sum(dim=-1)
@@ -399,7 +395,7 @@ class Router(nn.Module):
         weights = weights * self.route_scale
         return weights.type_as(x), indices
 
-class MOE(nn.Module): 
+class MOE(nn.Module):
     '''
     The mixture of experts module which will allow for the routing to different experts
 
@@ -408,20 +404,26 @@ class MOE(nn.Module):
         experts(nn.ModuleList): List of experts to route token tensor to
         shared_experts(MLP): experts that the tokens will be routed to on all occasions
     '''
-    def __init__(self, config: DPS_Config):
+    def __init__(self, config):
         '''
         Initialization of the MoE component
 
         Arguments:
             config(DPS_Config): holds the model's hyperparameters
         '''
-        super().__init__()
-        self.config = config
-        self.router = Router(config)
-        self.experts = nn.ModuleList([MLP(config.num_embd, config.expert_inter_size) for i in range(config.num_experts)])
-        self.shared_experts = MLP(config.num_embd, config.num_shared_experts * config.expert_inter_size)
+        super(MOE, self).__init__()
+        self.num_experts = config.num_experts
+        self.top_k = 2
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(config.num_embd, config.expert_inter_size),
+                nn.GELU(),
+                nn.Linear(config.expert_inter_size, config.num_embd)
+            ) for _ in range(config.num_experts)
+        ])
+        self.router = nn.Linear(config.num_embd, config.num_experts)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         '''
         Forward pass of the MoE component - will find which experts to route to, and route to them + shared experts
 
@@ -431,24 +433,78 @@ class MOE(nn.Module):
         Returns:
             torch.Tensor: returns x after undergoing expert operations
         '''
+        B, T, D = x.shape
+        x_flat = x.view(-1, D)
 
-        shape = x.size() # Storing original shape to use in return statement
-        x = x.view(-1, self.config.num_embd) 
-        weights, indices = self.router(x)
-        y = torch.zeros_like(x)
+        # Compute routing scores
+        scores = self.router(x_flat)
+        weights = torch.softmax(scores, dim=-1)
 
-        for index in range(x.size(0)): # For every token
-            for top in range(weights.size(1)): 
-                expert_idx = indices[index, top].item()
-                weight = weights[index, top]
-                expert = self.experts[expert_idx]
-                y[index] = y[index] + expert(x[index].unsqueeze(0)).squeeze(0) * weight
+        # Get top-k experts per token
+        topk_weights, topk_indices = torch.topk(weights, self.top_k, dim=-1)
 
-        z = self.shared_experts(x)
-        return (y + z).view(shape)
+        # Buffers
+        expert_inputs = [[] for _ in range(self.num_experts)]
+        expert_weights = [[] for _ in range(self.num_experts)]
+        expert_token_indices = [[] for _ in range(self.num_experts)]
+
+        for i in range(self.top_k):
+            expert_idx = topk_indices[:, i]
+            weight = topk_weights[:, i]
+            for expert_id in range(self.num_experts):
+                mask = (expert_idx == expert_id)
+                if mask.any():
+                    selected_x = x_flat[mask]
+                    selected_w = weight[mask]
+                    selected_i = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+
+                    expert_inputs[expert_id].append(selected_x)
+                    expert_weights[expert_id].append(selected_w)
+                    expert_token_indices[expert_id].append(selected_i)
+
+        y_flat = torch.zeros_like(x_flat)
+
+        for expert_id, expert in enumerate(self.experts):
+            if expert_inputs[expert_id]:
+                x_cat = torch.cat(expert_inputs[expert_id], dim=0)
+                w_cat = torch.cat(expert_weights[expert_id], dim=0)
+                i_cat = torch.cat(expert_token_indices[expert_id], dim=0)
+
+                y_cat = expert(x_cat)
+                y_cat = y_cat * w_cat.unsqueeze(1)
+                y_flat[i_cat] += y_cat
+
+        y = y_flat.view(B, T, D)
+        return y
+
 
 class MLA(nn.Module):
+    '''
+    The multiheaded latent attention module will allow the tokens to share context to each other
+
+    Attributes:
+        dim (int): The dimensionality of the input and output embeddings (num_embd)
+        n_heads (int): The number of attention heads
+        latent_dim (int): The dimensionality of the latent space for attention computation
+        head_dim (int): The dimensionality of a single attention head
+        q_proj (nn.Linear): Linear layer for projecting input to queries
+        k_proj (nn.Linear): Linear layer for projecting input to keys
+        v_proj (nn.Linear): Linear layer for projecting input to values
+        out_proj (nn.Linear): Linear layer for projecting the final attention output
+        compress_q (nn.Linear): Linear layer to compress query heads to the latent dimension
+        compress_k (nn.Linear): Linear layer to compress key heads to the latent dimension
+        compress_v (nn.Linear): Linear layer to compress value heads to the latent dimension
+        decompress (nn.Linear): Linear layer to decompress the latent output back to the head dimension
+        softmax_scale (float): The scaling factor for the softmax function, calculated as 1.0/ 
+        latent_dim
+    '''
     def __init__(self, config):
+        '''
+        Initialization of the MLA component
+
+        Arguments:
+            config(DPS_Config): holds the model's hyperparameters
+        '''
         super().__init__()
         self.dim = config.num_embd
         self.n_heads = config.num_attention_heads
@@ -472,6 +528,18 @@ class MLA(nn.Module):
         self.softmax_scale = 1.0 / math.sqrt(self.latent_dim)
 
     def forward(self, x: torch.Tensor, start_pos=0, freqs_cis=None, mask=None):
+        '''
+        Forward
+
+        Arguments:
+            x (torch.Tensor): The input tensor of shape (batch_size, sequence_length, embedding_dim)
+            start_pos (int, optional): The starting position of the sequence, used for slicing rotary embeddings. Defaults to 0
+            freqs_cis (torch.Tensor, optional): Precomputed rotary embeddings
+            mask (torch.Tensor, optional): A causal mask tensor of shape (sequence_length, sequence_length) to prevent attention to future tokens
+
+        Returns:
+            attn_output (torch.Tensor): The output tensor after the multi-head latent attention mechanism, with the same shape as the input x
+        '''
         B, T, D = x.size()
         H = self.n_heads
         Hd = self.head_dim
