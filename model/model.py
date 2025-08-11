@@ -216,11 +216,9 @@ def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Ten
 
 class Embedding(nn.Module):
     """
-    The embedding layer that can be computed using parallel processes
+    The embedding layer
 
     Attributes:
-        vocab_size (int): Vocabulary size.
-        num_embd (int): Number of dimensions to represent tokens
         weight (nn.Parameter): The embedding matrix
     """
     def __init__(self, vocab_size: int, num_embd: int):
@@ -243,7 +241,7 @@ class Embedding(nn.Module):
             x (torch.Tensor): input tokens
 
         Returns: 
-            y (torch.Tensor): (vocab_size, num_embd) size tensor of token embeddings
+            y (torch.Tensor): (input, num_embd) size tensor of token embeddings
         """
         # the translation of tokens to embeddings for this processor
         y = F.embedding(x, self.weight)
@@ -639,18 +637,14 @@ class DPS(nn.Module):
         super().__init__()
         self.config = config
 
-        # creating a module dict to use keys to refer to dict values
-        # dict consists of the initial up projection, the transformer blocks, the normalization, and then the down projection
         self.transformer = nn.ModuleDict(dict(
-            embed = Embedding(config.vocab_size, config.num_embd), # creates the embedding
+            embed = Embedding(config.vocab_size, config.num_embd), # creates the embedding (up projection)
             layers = nn.ModuleList([Block(i, config) for i in range(config.num_layers)]), # creates num_layers of transformer blocks
             rms_norm = RMSNorm(config.num_embd), # adds in an RMS norm at the end, after all of the transformer blocks
             output_proj = nn.Linear(config.num_embd, config.vocab_size) # finally down projects to get final predictions
         ))
 
-        # print("DEBUG: max_seq_len used to create rotary embeddings:", config.max_seq_len)
         self.register_buffer("rotary_embeddings", precompute_rope_embeddings(config), persistent=False)
-        print("Done Initializing Model")
 
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
 
@@ -680,10 +674,9 @@ class DPS(nn.Module):
         for layer in self.transformer.layers:
             embedded_tokens = layer(embedded_tokens, start_pos, rotary_embeddings, mask)
         
-        # normalizes the output and down projects to logits
-        embedded_tokens = self.transformer.rms_norm(embedded_tokens)
+        # normalizes the tokens, slices to get the predicted tokens only, and down projects to logits
+        embedded_tokens = self.transformer.rms_norm(embedded_tokens)[:, -1]
         logits = self.transformer.output_proj(embedded_tokens)
-        # print("Done calculating logits")
 
         return logits        
     
@@ -695,5 +688,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     x = torch.randint(0, config.vocab_size, (2, 128)) # creates a sample tensor of random values with size (2, 128)
     model = DPS(config) # creates a model using the config
-    print(model(x).size()) 
+    print(model(x).size())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters: {trainable_params}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
