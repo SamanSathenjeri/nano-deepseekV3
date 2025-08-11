@@ -169,46 +169,34 @@ def precompute_rope_embeddings(config: DPS_Config) -> torch.Tensor:
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
 
-def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+def apply_rope_embeddings(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, start_pos=0):
     """
-    Applies rope embeddings to query and key vectors
+    Applies RoPE embeddings to query and key vectors.
     
     q, k: [B, T, H, D]
-    freqs_cis: [T, D // 2] (complex)
+    freqs_cis: [seq_len, D//2] (complex)
     """
-    # Use q_dtype and k_dtype if they can differ, otherwise just one dtype for consistency
     q_dtype = q.dtype
     k_dtype = k.dtype
-    B, T, H, D = q.shape # Assuming q and k have the same shape
-
+    B, T, H, D = q.shape
     assert D % 2 == 0, f"Last dim {D} must be even to form complex pairs"
     D_half = D // 2
-
-    # D = num_embd/num_heads = 384/6 = 64
-    # print(freqs_cis.shape)
 
     q = q.to(torch.float32)
     k = k.to(torch.float32)
 
-    # --- Process Q ---
-    q_reshaped = q.float().view(B, T, H, D_half, 2)
-    q_complex = torch.view_as_complex(q_reshaped)
-    # print(q_complex.shape)
+    # Convert to complex
+    q_complex = torch.view_as_complex(q.view(B, T, H, D_half, 2))
+    k_complex = torch.view_as_complex(k.view(B, T, H, D_half, 2))
 
-    # --- Process K ---
-    k_reshaped = k.float().view(B, T, H, D_half, 2)
-    k_complex = torch.view_as_complex(k_reshaped)
+    # Slice precomputed RoPE frequencies
+    freqs_slice = freqs_cis[start_pos : start_pos + T]  # [T, D_half]
+    freqs_slice = freqs_slice.view(1, T, 1, D_half)     # broadcastable
 
-    # Prepare freqs_cis (same for both q and k)
-    D_half = freqs_cis.shape[-1]
-    freqs_cis = freqs_cis[:T].view(1, T, 1, D_half)
-    # print(freqs_cis.shape)
+    # Apply rotation
+    q_rotated = q_complex * freqs_slice
+    k_rotated = k_complex * freqs_slice
 
-    # Complex multiplication
-    q_rotated = q_complex * freqs_cis
-    k_rotated = k_complex * freqs_cis
-
-    # Convert back to real
     q_out = torch.view_as_real(q_rotated).view(B, T, H, D)
     k_out = torch.view_as_real(k_rotated).view(B, T, H, D)
 
@@ -323,158 +311,87 @@ class MLP(nn.Module):
             torch.Tensor: output tensor after MLP operations
         '''
         return self.layer2(F.silu(self.layer1(x)) * self.layer3(x))
-    
+
 class Router(nn.Module):
-    '''
-    Implementation of Routing mechanism for MoE
-
-    Attributes:
-        num_embd(int) = token embedding space
-        num_activated_experts(int) = number of experts activated per token
-        num_expert_groups(int) = number of groups of experts (grouping allows to consolidate computation)
-        num_limited_groups(int) = number of experts per group
-        score_function(int) = use of sigmoid or softmax to normalize routing activations
-        route_scale(int) = scaling factor per route
-        weight(nn.Parameter) = learnable weight parameters to learn which experts to route to
-        bias(nn.Parameter) = learnable bias parameter to learn which experts to route to
-    '''
-
-    def __init__(self, config: DPS_Config):
-        '''
-        Initialization of the Router component
-
-        Arguments:
-            config(DPS_config): holds the model's arguments
-        '''
+    def __init__(self, num_embd, num_experts, top_k=2):
+        """
+        Router for Mixture of Experts
+        num_embd: hidden dimension of the input
+        num_experts: total number of experts
+        top_k: number of experts to select per token
+        """
         super().__init__()
-        self.num_embd = config.num_embd
-        self.num_activated_experts = config.num_activated_experts
-        self.num_expert_groups = config.n_expert_groups
-        self.num_limited_groups = config.n_limited_groups
-        self.score_function = config.score_function
-        self.route_scale = config.route_scale
-        self.weight = nn.Parameter(torch.empty(config.num_experts, config.num_embd))
-        self.bias = nn.Parameter(torch.empty(config.num_experts)) if self.num_embd == 1024 else None
-
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        '''
-        The forward pass of the Router component
-
-        Arguments:
-            x(torch.Tensor): the input token tensor
-
-        Returns:
-            torch.Tensor: returns x with routing information
-        '''
-        scores = F.linear(x, self.weight, self.bias)
-        scores = scores.softmax(dim=-1) if self.score_function == "softmax" else scores.sigmoid()
-        original_scores = scores
-
-        # NOTE: SMALL MODEL, SO NO EXPERT GROUPS ***************
-        # if self.num_expert_groups > 1:
-        #     scores = scores.view(x.size(0), self.num_expert_groups, -1)
-        #     group_scores = scores.amax(dim=-1) if self.bias is None else scores.topk(2, dim=-1)[0].sum(dim=-1)
-        #     indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-        #     mask = scores.new_ones(x.size(0), self.num_expert_groups, dtype=bool).scatter_(1, indices, False)
-        #     scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        
-        indices = torch.topk(scores, self.num_activated_experts, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
-
-        if self.score_function == "sigmoid":
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
-
-        weights = weights * self.route_scale
-        return weights.type_as(x), indices
-
-class MOE(nn.Module):
-    '''
-    The mixture of experts module which will allow for the routing to different experts
-
-    Attributes:
-        router(Router): the routing class to compute routing paths
-        experts(nn.ModuleList): List of experts to route token tensor to
-        shared_experts(MLP): experts that the tokens will be routed to on all occasions
-    '''
-    def __init__(self, config):
-        '''
-        Initialization of the MoE component
-
-        Arguments:
-            config(DPS_Config): holds the model's hyperparameters
-        '''
-        super(MOE, self).__init__()
-        self.num_experts = config.num_experts
-        self.top_k = 2
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(config.num_embd, config.expert_inter_size),
-                nn.GELU(),
-                nn.Linear(config.expert_inter_size, config.num_embd)
-            ) for _ in range(config.num_experts)
-        ])
-        self.router = nn.Linear(config.num_embd, config.num_experts)
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(num_embd, num_experts, bias=False)
 
     def forward(self, x):
-        '''
-        Forward pass of the MoE component - will find which experts to route to, and route to them + shared experts
+        """
+        Input: x -> [batch, seq_len, dim]
+        Output: dispatch_mask, combine_weights, selected_experts
+        """
+        # Compute logits for each expert
+        logits = self.gate(x)  # [batch, seq_len, num_experts]
+        # Softmax over experts to get normalized gate scores
+        gate_scores = F.softmax(logits, dim=-1)
 
-        Arguments: 
-            x(torch.Tensor): input tensor
+        # Select top-k experts per token
+        topk_scores, topk_indices = torch.topk(gate_scores, self.top_k, dim=-1)  # [batch, seq_len, top_k]
 
-        Returns:
-            torch.Tensor: returns x after undergoing expert operations
-        '''
-        B, T, D = x.shape
-        x_flat = x.view(-1, D)
+        # Create one-hot dispatch mask
+        dispatch_mask = torch.zeros_like(gate_scores).unsqueeze(-1)  # [batch, seq_len, num_experts, 1]
+        batch_indices = torch.arange(x.size(0), device=x.device)[:, None, None]
+        seq_indices = torch.arange(x.size(1), device=x.device)[None, :, None]
 
-        # Compute routing scores
-        scores = self.router(x_flat)
-        weights = torch.softmax(scores, dim=-1)
+        for k in range(self.top_k):
+            dispatch_mask[batch_indices, seq_indices, topk_indices[..., k], 0] = 1.0
 
-        # Get top-k experts per token
-        topk_weights, topk_indices = torch.topk(weights, self.top_k, dim=-1)
+        # Normalize combine weights
+        combine_weights = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-9)  # [batch, seq_len, top_k]
 
-        # Buffers
-        expert_inputs = [[] for _ in range(self.num_experts)]
-        expert_weights = [[] for _ in range(self.num_experts)]
-        expert_token_indices = [[] for _ in range(self.num_experts)]
+        return dispatch_mask, combine_weights, topk_indices
 
-        for i in range(self.top_k):
-            expert_idx = topk_indices[:, i]
-            weight = topk_weights[:, i]
-            for expert_id in range(self.num_experts):
-                mask = (expert_idx == expert_id)
-                if mask.any():
-                    selected_x = x_flat[mask]
-                    selected_w = weight[mask]
-                    selected_i = torch.nonzero(mask, as_tuple=False).squeeze(-1)
 
-                    expert_inputs[expert_id].append(selected_x)
-                    expert_weights[expert_id].append(selected_w)
-                    expert_token_indices[expert_id].append(selected_i)
+class MOE(nn.Module):
+    def __init__(self, dim, num_experts, top_k=2, hidden_dim=2048):
+        """
+        Mixture of Experts module
+        dim: input and output dimension
+        num_experts: number of experts
+        top_k: number of experts per token
+        hidden_dim: dimension of the expert's FFN layer
+        """
+        super().__init__()
+        self.router = Router(dim, num_experts, top_k)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, dim)
+            )
+            for _ in range(num_experts)
+        ])
 
-        y_flat = torch.zeros_like(x_flat)
+    def forward(self, x):
+        """
+        Input: x -> [batch, seq_len, dim]
+        Output: y -> [batch, seq_len, dim]
+        """
+        dispatch_mask, combine_weights, topk_indices = self.router(x)
 
-        for expert_id, expert in enumerate(self.experts):
-            if expert_inputs[expert_id]:
-                x_cat = torch.cat(expert_inputs[expert_id], dim=0)
-                w_cat = torch.cat(expert_weights[expert_id], dim=0)
-                i_cat = torch.cat(expert_token_indices[expert_id], dim=0)
+        expert_outputs = torch.zeros_like(x)
+        for k in range(self.router.top_k):
+            selected_expert_idx = topk_indices[..., k]  # [batch, seq_len]
+            mask = (selected_expert_idx.unsqueeze(-1) == torch.arange(self.router.num_experts, device=x.device)).any(dim=-1)
 
-                y_cat = expert(x_cat)
-                y_cat = y_cat * w_cat.unsqueeze(1)
-                y_flat[i_cat] += y_cat
+            for expert_idx in range(self.router.num_experts):
+                expert_mask = (selected_expert_idx == expert_idx)  # [batch, seq_len]
+                if expert_mask.any():
+                    tokens = x[expert_mask]  # [num_tokens, dim]
+                    processed = self.experts[expert_idx](tokens)  # FFN
+                    expert_outputs[expert_mask] += processed * combine_weights[..., k][expert_mask].unsqueeze(-1)
 
-        y = y_flat.view(B, T, D)
-        return y
-
+        return expert_outputs
 
 class MLA(nn.Module):
     '''
@@ -504,24 +421,25 @@ class MLA(nn.Module):
             config(DPS_Config): holds the model's hyperparameters
         '''
         super().__init__()
-        self.dim = config.num_embd
-        self.n_heads = config.num_attention_heads
-        self.latent_dim = config.latent_dim  # e.g. 16
-        self.head_dim = self.dim // self.n_heads
-        assert self.dim % self.n_heads == 0, "Embedding dim must be divisible by number of heads"
+        self.num_attention_heads = config.num_attention_heads
+        self.latent_dim = config.latent_dim
+        self.head_dim = config.num_embd // self.num_attention_heads
+        assert config.num_embd % self.num_attention_heads == 0
 
-        self.q_proj = nn.Linear(self.dim, self.dim)
-        self.k_proj = nn.Linear(self.dim, self.dim)
-        self.v_proj = nn.Linear(self.dim, self.dim)
-        self.out_proj = nn.Linear(self.dim, self.dim)
+        self.ln = nn.LayerNorm(config.num_embd)
 
-        # Latent compression: reduce head_dim to latent_dim
+        self.q_proj = nn.Linear(config.num_embd, config.num_embd)
+        self.k_proj = nn.Linear(config.num_embd, config.num_embd)
+        self.v_proj = nn.Linear(config.num_embd, config.num_embd)
+        self.out_proj = nn.Linear(config.num_embd, config.num_embd)
+
         self.compress_q = nn.Linear(self.head_dim, self.latent_dim)
         self.compress_k = nn.Linear(self.head_dim, self.latent_dim)
         self.compress_v = nn.Linear(self.head_dim, self.latent_dim)
-
-        # Latent decompression: bring it back to head_dim
         self.decompress = nn.Linear(self.latent_dim, self.head_dim)
+
+        self.attn_dropout = nn.Dropout(getattr(config, "attn_dropout", 0.0))
+        self.out_dropout = nn.Dropout(getattr(config, "out_dropout", 0.0))
 
         self.softmax_scale = 1.0 / math.sqrt(self.latent_dim)
 
@@ -539,34 +457,63 @@ class MLA(nn.Module):
             attn_output (torch.Tensor): The output tensor after the multi-head latent attention mechanism, with the same shape as the input x
         '''
         B, T, D = x.size()
-        H = self.n_heads
+        H = self.num_attention_heads
         Hd = self.head_dim
+        L = self.latent_dim
+        x_norm = self.ln(x)
 
-        q = self.q_proj(x).view(B, T, H, Hd)
-        k = self.k_proj(x).view(B, T, H, Hd)
-        v = self.v_proj(x).view(B, T, H, Hd)
+        q = self.q_proj(x_norm).view(B, T, H, Hd)
+        k = self.k_proj(x_norm).view(B, T, H, Hd)
+        v = self.v_proj(x_norm).view(B, T, H, Hd)
 
-        # Slice rotary embeddings to current sequence length T
         if freqs_cis is not None:
-            freqs_cis = freqs_cis[start_pos : start_pos + T, :]
+            freqs_cis = freqs_cis[start_pos:start_pos+T, :]
+        q, k = apply_rope_embeddings(q, k, freqs_cis)  # NOTE ****** ensure apply_rope accepts (B,T,H,Hd)
 
-        q, k = apply_rope_embeddings(q, k, freqs_cis)
-        q_latent = self.compress_q(q)
-        k_latent = self.compress_k(k)
-        v_latent = self.compress_v(v)
+        # compress to latent
+        # result shapes: (B, T, H, L)
+        q_lat = self.compress_q(q)
+        k_lat = self.compress_k(k)
+        v_lat = self.compress_v(v)
 
-        scores = torch.einsum("bTHl,bSHl->bHTS", q_latent, k_latent) * self.softmax_scale
+        # merge batch and heads for fast matmul
+        # (B*H, T, L)
+        q_lat = q_lat.permute(0,2,1,3).contiguous().view(B*H, T, L)
+        k_lat = k_lat.permute(0,2,1,3).contiguous().view(B*H, T, L)
+        v_lat = v_lat.permute(0,2,1,3).contiguous().view(B*H, T, L)
 
+        # (B*H, T, T)
+        scores = torch.matmul(q_lat, k_lat.transpose(-2, -1)) * self.softmax_scale
+
+        # mask: allow bool or additive mask
         if mask is not None:
-            expanded_mask = mask.unsqueeze(0).unsqueeze(0)
-            scores = scores + expanded_mask
+            # mask expected shape (T,T) or (B,T,T). Convert to additive -inf mask broadcastable to (B*H,T,T)
+            if mask.dtype == torch.bool:
+                additive = (~mask).to(scores.dtype) * -1e9  # (T,T) or (B,T,T)
+            else:
+                additive = mask  # assume already additive
+            # expand to (B*H, T, T)
+            if additive.dim() == 2:
+                additive = additive.unsqueeze(0)  # (1,T,T)
+            additive = additive.expand(B, -1, -1).reshape(B*H, T, T)
+            scores = scores + additive
 
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_output = torch.einsum("bhts,bshl->bthl", attn_weights, v_latent)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
 
-        attn_output = self.decompress(attn_output)
-        attn_output = attn_output.contiguous().view(B, T, D)
-        return self.out_proj(attn_output)
+        # attn @ v -> (B*H, T, L)
+        out = torch.matmul(attn, v_lat)
+
+        # unmerge heads: (B, H, T, L) -> (B, T, H, L)
+        out = out.view(B, H, T, L).permute(0,2,1,3).contiguous()
+
+        # decompress per-head latent -> head_dim: (B,T,H,Hd)
+        out = self.decompress(out)
+
+        out = out.view(B, T, D)
+        out = self.out_proj(out)
+        out = self.out_dropout(out)
+        return out
         
 class Block(nn.Module):
     """
